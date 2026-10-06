@@ -1,7 +1,10 @@
 //! Facts about the watched path itself: where it lives and how full that is.
 
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -78,6 +81,7 @@ impl Target {
 
 /// The mount `path` lives on: the longest mount point that is a prefix of it,
 /// the last one listed if several are stacked on the same point.
+#[cfg(target_os = "linux")]
 pub fn find_mount(path: &Path) -> Option<Mount> {
     let info = fs::read_to_string("/proc/self/mountinfo").ok()?;
     let mut best: Option<Mount> = None;
@@ -111,11 +115,13 @@ pub fn find_mount(path: &Path) -> Option<Mount> {
     best
 }
 
+#[cfg(target_os = "linux")]
 fn unescape_str(s: &str) -> String {
     String::from_utf8_lossy(unescape(s).as_os_str().as_bytes()).into_owned()
 }
 
 /// mountinfo escapes space, tab, newline and backslash as `\040` style octal.
+#[cfg(target_os = "linux")]
 fn unescape(s: &str) -> PathBuf {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -142,6 +148,7 @@ fn unescape(s: &str) -> PathBuf {
     PathBuf::from(std::ffi::OsString::from_vec(out))
 }
 
+#[cfg(target_os = "linux")]
 pub fn space(path: &Path) -> Option<Space> {
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: `c` is a valid NUL-terminated path and `st` a writable statvfs.
@@ -159,7 +166,7 @@ pub fn space(path: &Path) -> Option<Space> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
@@ -189,4 +196,13 @@ mod tests {
         t.root = PathBuf::from("/tmp/x.bin");
         assert_eq!(t.rel(Path::new("/tmp/x.bin")), "x.bin");
     }
+}
+
+#[cfg(windows)]
+pub fn find_mount(path: &Path) -> Option<Mount> {
+    crate::windows::mount(path)
+}
+#[cfg(windows)]
+pub fn space(path: &Path) -> Option<Space> {
+    crate::windows::space(path)
 }

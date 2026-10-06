@@ -7,9 +7,14 @@ description = "btop-style TUI showing which processes are reading, writing and o
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-libc = "0.2.190"
 ratatui = "0.30.2"
 unicode-width = "0.2.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.190"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
 
 [profile.release]
 lto = "thin"

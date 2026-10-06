@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -9,12 +9,38 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::TableState;
 
-use crate::scan::{self, Cmd, FolderActivity, ProcActivity, Snapshot};
+use crate::scan::{self, Access, Cmd, FolderActivity, Kind, Mode, ProcActivity, Snapshot};
 use crate::target::Target;
 
 const HISTORY: usize = 1000;
 const PROC_HISTORY: usize = 240;
 const INTERVALS_MS: [u64; 7] = [100, 250, 500, 1000, 2000, 5000, 10000];
+
+pub struct ReadSample {
+    pub at: Instant,
+    pub bps: f64,
+    pub disk_bps: Option<f64>,
+    pub total: u64,
+    pub observed: bool,
+}
+
+pub struct FileVisit {
+    pub path: PathBuf,
+    pub kind: Kind,
+    pub access: Access,
+    pub first_seen: Instant,
+    pub last_seen: Instant,
+    pub last_read: Option<Instant>,
+    pub last_write: Option<Instant>,
+    pub open: Option<bool>,
+    pub visits: u32,
+    pub read_bps: f64,
+    pub write_bps: f64,
+    pub pos: u64,
+    pub size: u64,
+    pub deleted: bool,
+    pub shared: bool,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
@@ -60,11 +86,15 @@ pub enum Focus {
 }
 
 pub struct App {
+    pub mode: Mode,
     pub target: Target,
     pub snap: Option<Snapshot>,
     /// (read, write) bytes/s of the whole path, oldest first.
     pub history: VecDeque<(f64, f64)>,
     pub proc_history: HashMap<u32, VecDeque<(f64, f64)>>,
+    pub read_history: HashMap<u32, VecDeque<ReadSample>>,
+    pub file_history: HashMap<u32, Vec<FileVisit>>,
+    identities: HashMap<u32, u64>,
 
     /// Indices into `snap.procs`, filtered and sorted for display.
     pub view: Vec<usize>,
@@ -92,6 +122,7 @@ pub struct App {
     pub file_rows: Rect,
 
     pub show_help: bool,
+    pub show_file_details: bool,
     pub quit: bool,
     cmds: Sender<Cmd>,
 }
@@ -99,10 +130,14 @@ pub struct App {
 impl App {
     pub fn new(target: Target, interval: Duration, cmds: Sender<Cmd>) -> Self {
         Self {
+            mode: Mode::Path,
             target,
             snap: None,
             history: VecDeque::new(),
             proc_history: HashMap::new(),
+            read_history: HashMap::new(),
+            file_history: HashMap::new(),
+            identities: HashMap::new(),
             view: Vec::new(),
             folders: Vec::new(),
             folder_depth: 0,
@@ -121,6 +156,7 @@ impl App {
             proc_rows: Rect::default(),
             file_rows: Rect::default(),
             show_help: false,
+            show_file_details: false,
             quit: false,
             cmds,
         }
@@ -132,23 +168,137 @@ impl App {
     }
 
     pub fn on_snapshot(&mut self, snap: Snapshot) {
-        if self.paused {
+        if self.paused || snap.mode != self.mode {
             return;
         }
+        let selected_file = self.selected.and_then(|pid| {
+            self.file_history
+                .get(&pid)
+                .and_then(|files| self.file_state.selected().and_then(|i| files.get(i)))
+                .map(|file| (pid, file.path.clone()))
+        });
         push_capped(
             &mut self.history,
             (snap.totals.read_bps, snap.totals.write_bps),
             HISTORY,
         );
         for p in &snap.procs {
+            if self
+                .identities
+                .insert(p.pid, p.identity)
+                .is_some_and(|old| old != p.identity)
+            {
+                self.proc_history.remove(&p.pid);
+                self.read_history.remove(&p.pid);
+                self.file_history.remove(&p.pid);
+            }
             let h = self.proc_history.entry(p.pid).or_default();
             push_capped(h, (p.read_bps, p.write_bps), PROC_HISTORY);
+            if self.mode == Mode::ReadHistory && p.io.is_some() {
+                push_capped(
+                    self.read_history.entry(p.pid).or_default(),
+                    ReadSample {
+                        at: Instant::now(),
+                        bps: p.read_bps,
+                        disk_bps: if cfg!(target_os = "linux") {
+                            p.io.map(|io| io.read_bytes_bps)
+                        } else {
+                            None
+                        },
+                        total: p.read_total,
+                        observed: p.io.is_some(),
+                    },
+                    PROC_HISTORY,
+                );
+            }
+            if self.mode == Mode::ReadHistory {
+                let now = Instant::now();
+                let visits = self.file_history.entry(p.pid).or_default();
+                let previously_open: std::collections::HashSet<_> = visits
+                    .iter()
+                    .filter(|v| v.open == Some(true))
+                    .map(|v| v.path.clone())
+                    .collect();
+                for visit in visits.iter_mut() {
+                    visit.open = if p.files_observed { Some(false) } else { None };
+                    visit.read_bps = 0.0;
+                    visit.write_bps = 0.0;
+                }
+                for file in &p.files {
+                    let index = visits
+                        .iter()
+                        .position(|v| v.path == file.path)
+                        .unwrap_or_else(|| {
+                            visits.push(FileVisit {
+                                path: file.path.clone(),
+                                kind: file.kind,
+                                access: file.access,
+                                first_seen: now,
+                                last_seen: now,
+                                last_read: None,
+                                last_write: None,
+                                open: Some(false),
+                                visits: 0,
+                                read_bps: 0.0,
+                                write_bps: 0.0,
+                                pos: file.pos,
+                                size: file.size,
+                                deleted: file.deleted,
+                                shared: file.shared,
+                            });
+                            visits.len() - 1
+                        });
+                    let visit = &mut visits[index];
+                    if visit.open != Some(true) && !previously_open.contains(&file.path) {
+                        visit.visits += 1;
+                    }
+                    visit.open = Some(true);
+                    visit.last_seen = now;
+                    // Multiple handles on one path are merged for the history list.
+                    if visit.access != file.access {
+                        visit.access = Access::ReadWrite;
+                    }
+                    visit.read_bps += file.read_bps;
+                    visit.write_bps += file.write_bps;
+                    if file.read_bps > 0.0 {
+                        visit.last_read = Some(now);
+                    }
+                    if file.write_bps > 0.0 {
+                        visit.last_write = Some(now);
+                    }
+                    visit.pos = file.pos;
+                    visit.size = file.size;
+                    visit.deleted = file.deleted;
+                    visit.shared = file.shared;
+                }
+                visits.sort_by(|a, b| {
+                    b.last_seen
+                        .cmp(&a.last_seen)
+                        .then_with(|| a.path.cmp(&b.path))
+                });
+                visits.truncate(256);
+            }
         }
         self.proc_history
+            .retain(|pid, _| snap.procs.iter().any(|p| p.pid == *pid));
+        self.read_history
+            .retain(|pid, _| snap.procs.iter().any(|p| p.pid == *pid));
+        self.identities
+            .retain(|pid, _| snap.procs.iter().any(|p| p.pid == *pid));
+        self.file_history
             .retain(|pid, _| snap.procs.iter().any(|p| p.pid == *pid));
         self.target.refresh_space();
         self.snap = Some(snap);
         self.rebuild_view();
+        if let Some((pid, path)) = selected_file.filter(|(pid, _)| self.selected == Some(*pid)) {
+            if let Some(index) = self
+                .file_history
+                .get(&pid)
+                .and_then(|files| files.iter().position(|f| f.path == path))
+            {
+                self.file_state.select(Some(index));
+            }
+        }
     }
 
     /// Re-derive the visible, sorted process list and the folder list.
@@ -158,8 +308,19 @@ impl App {
         let mut view: Vec<usize> = (0..snap.procs.len())
             .filter(|&i| {
                 let p = &snap.procs[i];
-                (!self.active_only || p.bps() > 0.0)
-                    && (needle.is_empty() || matches_filter(p, &needle))
+                (!self.active_only
+                    || if self.mode == Mode::ReadHistory {
+                        p.read_bps > 0.0
+                    } else {
+                        p.bps() > 0.0
+                    })
+                    && (needle.is_empty()
+                        || matches_filter(p, &needle)
+                        || self.file_history.get(&p.pid).is_some_and(|files| {
+                            files
+                                .iter()
+                                .any(|f| f.path.to_string_lossy().to_lowercase().contains(&needle))
+                        }))
             })
             .collect();
 
@@ -203,7 +364,7 @@ impl App {
         self.selected = idx.map(|i| procs[self.view[i]].pid);
         self.proc_state.select(idx);
 
-        let n_files = self.selected_proc().map_or(0, |p| p.files.len());
+        let n_files = self.file_count();
         let f = self.file_state.selected().unwrap_or(0);
         self.file_state
             .select((n_files > 0).then(|| f.min(n_files - 1)));
@@ -211,7 +372,7 @@ impl App {
 
     fn move_selection(&mut self, delta: isize) {
         if self.focus == Focus::Files {
-            let n = self.selected_proc().map_or(0, |p| p.files.len());
+            let n = self.file_count();
             if n > 0 {
                 let i = self.file_state.selected().unwrap_or(0) as isize;
                 self.file_state
@@ -224,7 +385,7 @@ impl App {
         }
         let i = self.proc_state.selected().unwrap_or(0) as isize;
         let i = (i + delta).clamp(0, self.view.len() as isize - 1) as usize;
-        self.pinned = i != 0 || delta > 0;
+        self.pinned = self.mode == Mode::ReadHistory || i != 0 || delta > 0;
         self.proc_state.select(Some(i));
         let pid = self.snap.as_ref().map(|s| s.procs[self.view[i]].pid);
         if pid != self.selected {
@@ -267,11 +428,18 @@ impl App {
             self.show_help = false;
             return;
         }
+        if self.show_file_details {
+            self.show_file_details = false;
+            return;
+        }
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Enter if self.mode == Mode::ReadHistory && self.focus == Focus::Files => {
+                self.show_file_details = self.file_count() > 0;
+            }
             KeyCode::Esc => {
                 if !self.filter.is_empty() {
                     self.filter.clear();
@@ -291,6 +459,9 @@ impl App {
                     Focus::Procs => Focus::Files,
                     Focus::Files => Focus::Procs,
                 };
+                if self.mode == Mode::ReadHistory {
+                    self.pinned = true;
+                }
             }
             KeyCode::Right | KeyCode::Char('s') => self.set_sort(self.sort.step(1)),
             KeyCode::Left => self.set_sort(self.sort.step(-1)),
@@ -305,6 +476,31 @@ impl App {
             KeyCode::Char('g') => {
                 self.folder_depth = (self.folder_depth + 1) % 4;
                 self.rebuild_view();
+            }
+            KeyCode::Char('m') => {
+                self.mode = if self.mode == Mode::Path {
+                    Mode::ReadHistory
+                } else {
+                    Mode::Path
+                };
+                self.sort = if self.mode == Mode::ReadHistory {
+                    SortKey::Read
+                } else {
+                    SortKey::Io
+                };
+                self.history.clear();
+                self.proc_history.clear();
+                self.read_history.clear();
+                self.file_history.clear();
+                self.identities.clear();
+                self.snap = None;
+                self.view.clear();
+                self.folders.clear();
+                self.selected = None;
+                self.pinned = false;
+                self.focus = Focus::Procs;
+                self.paused = false;
+                let _ = self.cmds.send(Cmd::Mode(self.mode));
             }
             KeyCode::Char('p') | KeyCode::Char(' ') => self.paused = !self.paused,
             KeyCode::Char('+') | KeyCode::Char('=') => self.step_interval(1),
@@ -347,7 +543,7 @@ impl App {
                     }
                 } else if self.file_rows.contains(pos) {
                     let row = (pos.y - self.file_rows.y) as usize + self.file_state.offset();
-                    if row < self.selected_proc().map_or(0, |p| p.files.len()) {
+                    if row < self.file_count() {
                         self.focus = Focus::Files;
                         self.file_state.select(Some(row));
                     }
@@ -360,6 +556,16 @@ impl App {
     fn set_sort(&mut self, key: SortKey) {
         self.sort = key;
         self.rebuild_view();
+    }
+
+    fn file_count(&self) -> usize {
+        if self.mode == Mode::ReadHistory {
+            self.selected
+                .and_then(|pid| self.file_history.get(&pid))
+                .map_or(0, Vec::len)
+        } else {
+            self.selected_proc().map_or(0, |p| p.files.len())
+        }
     }
 
     fn step_interval(&mut self, by: isize) {
@@ -456,6 +662,7 @@ mod tests {
     fn proc(pid: u32, comm: &str, read_bps: f64, files: Vec<OpenFile>) -> ProcActivity {
         ProcActivity {
             pid,
+            identity: pid as u64,
             ppid: 1,
             comm: comm.into(),
             cmdline: format!("/usr/bin/{comm} --flag"),
@@ -463,6 +670,7 @@ mod tests {
             state: 'S',
             cwd: None,
             files,
+            files_observed: true,
             read_bps,
             write_bps: 0.0,
             read_total: 0,
@@ -483,6 +691,8 @@ mod tests {
             scanned: 0,
             denied: 0,
             scan_time: Duration::ZERO,
+            mode: Mode::Path,
+            warning: None,
         }
     }
 
@@ -600,5 +810,90 @@ mod tests {
         assert_eq!(g[0].read_bps, 3.0);
         assert_eq!(g[0].pids, [1], "same pid in two subfolders counts once");
         assert_eq!(g[0].files, 2);
+    }
+
+    #[test]
+    fn mode_switch_rejects_stale_snapshots_and_resets_history() {
+        let (tx, rx) = mpsc::channel();
+        let mut a = App::new(
+            Target::new(PathBuf::from(".")),
+            Duration::from_millis(500),
+            tx,
+        );
+        a.on_snapshot(snap(vec![proc(1, "reader", 100.0, vec![])]));
+        a.on_key(KeyEvent::from(KeyCode::Char('m')));
+        assert_eq!(a.mode, Mode::ReadHistory);
+        assert_eq!(a.sort.label(), "read");
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Cmd::Mode(Mode::ReadHistory)
+        ));
+        assert!(a.history.is_empty());
+        a.on_snapshot(snap(vec![proc(1, "reader", 100.0, vec![])]));
+        assert!(a.snap.is_none(), "queued path snapshots must be ignored");
+        let mut s = snap(vec![proc(1, "reader", 100.0, vec![])]);
+        s.mode = Mode::ReadHistory;
+        s.procs[0].io = Some(crate::scan::ProcIo::default());
+        a.on_snapshot(s);
+        assert_eq!(a.read_history[&1].len(), 1);
+        a.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(a.focus, Focus::Files);
+    }
+
+    #[test]
+    fn read_history_survives_unobservable_process_and_resets_on_pid_reuse() {
+        let mut a = app();
+        a.mode = Mode::ReadHistory;
+        let mut s = snap(vec![proc(42, "reader", 100.0, vec![])]);
+        s.mode = Mode::ReadHistory;
+        s.procs[0].io = Some(crate::scan::ProcIo::default());
+        for _ in 0..300 {
+            a.on_snapshot(s.clone());
+        }
+        assert_eq!(a.read_history[&42].len(), PROC_HISTORY);
+        let mut unseen = s.clone();
+        unseen.procs[0].io = None;
+        unseen.procs[0].read_bps = 0.0;
+        a.on_snapshot(unseen);
+        assert_eq!(a.read_history[&42].back().unwrap().bps, 100.0);
+        s.procs[0].identity += 1;
+        a.on_snapshot(s);
+        assert_eq!(a.read_history[&42].len(), 1);
+    }
+
+    #[test]
+    fn file_history_keeps_closed_files_and_unknown_visibility() {
+        let mut a = app();
+        a.mode = Mode::ReadHistory;
+        let mut snapshot = snap(vec![proc(
+            42,
+            "reader",
+            100.0,
+            vec![file("/tmp/data.bin", 100.0)],
+        )]);
+        snapshot.mode = Mode::ReadHistory;
+        snapshot.procs[0].io = Some(crate::scan::ProcIo::default());
+        a.on_snapshot(snapshot.clone());
+        let visit = &a.file_history[&42][0];
+        assert_eq!(visit.open, Some(true));
+        assert_eq!(visit.visits, 1);
+        assert!(visit.last_read.is_some());
+        snapshot.procs[0].files.clear();
+        a.on_snapshot(snapshot.clone());
+        assert_eq!(a.file_history[&42][0].open, Some(false));
+        a.filter = "data.bin".into();
+        a.rebuild_view();
+        assert_eq!(pids(&a), [42], "closed file paths can be searched");
+        snapshot.procs[0].files_observed = false;
+        a.on_snapshot(snapshot.clone());
+        assert_eq!(a.file_history[&42][0].open, None);
+        snapshot.procs[0].files_observed = true;
+        snapshot.procs[0].files.push(file("/tmp/data.bin", 0.0));
+        a.on_snapshot(snapshot);
+        assert_eq!(a.file_history[&42][0].visits, 2);
+        a.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(a.file_count(), 1);
+        a.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(a.file_state.selected(), Some(0));
     }
 }

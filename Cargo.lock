@@ -1749,6 +1749,7 @@ dependencies = [
  "libc",
  "ratatui",
  "unicode-width",
+ "windows-sys",
 ]
 
 [[package]]

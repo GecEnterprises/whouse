@@ -4,6 +4,10 @@ mod scan;
 mod target;
 mod ui;
 mod util;
+#[cfg(windows)]
+mod windows;
+#[cfg(not(any(windows, target_os = "linux")))]
+compile_error!("whouse supports Linux and Windows");
 
 use std::io::stdout;
 use std::path::PathBuf;
@@ -18,7 +22,7 @@ use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, E
 use ratatui::crossterm::execute;
 
 use app::App;
-use scan::{Options, Scanner, Snapshot};
+use scan::{Mode, Options, Scanner, Snapshot};
 use target::Target;
 
 #[derive(Parser)]
@@ -31,11 +35,19 @@ struct Cli {
     #[arg(default_value = ".")]
     path: PathBuf,
 
+    /// Watch a path, or system-wide per-process read I/O history
+    #[arg(long, value_enum, default_value_t = Mode::Path)]
+    mode: Mode,
+
+    /// Watch only this PID in read-history mode
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pid: Option<u32>,
+
     /// Refresh interval in milliseconds
     #[arg(short, long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(50..=10_000))]
     interval: u64,
 
-    /// Skip /proc/<pid>/maps, so memory-mapped files are not reported (cheaper on busy machines)
+    /// Skip memory-mapped files in Linux path mode
     #[arg(long)]
     no_maps: bool,
 }
@@ -47,8 +59,16 @@ enum Msg {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let root = std::fs::canonicalize(&cli.path)
-        .with_context(|| format!("cannot open {}", cli.path.display()))?;
+    if cli.pid.is_some() && cli.mode != Mode::ReadHistory {
+        bail!("--pid requires --mode read-history");
+    }
+    let root = if cli.mode == Mode::Path {
+        std::fs::canonicalize(&cli.path)
+            .with_context(|| format!("cannot open {}", cli.path.display()))?
+    } else {
+        std::env::current_dir().context("cannot determine current directory")?
+    };
+    #[cfg(target_os = "linux")]
     if !std::path::Path::new("/proc/self/fd").is_dir() {
         bail!("/proc is not mounted: whouse needs it to see open files");
     }
@@ -61,6 +81,8 @@ fn main() -> Result<()> {
         root.clone(),
         Options {
             maps: !cli.no_maps,
+            mode: cli.mode,
+            pid: cli.pid,
             ..Options::default()
         },
     );
@@ -76,6 +98,10 @@ fn main() -> Result<()> {
     });
 
     let mut app = App::new(Target::new(root), interval, cmd_tx);
+    app.mode = cli.mode;
+    if cli.mode == Mode::ReadHistory {
+        app.sort = app::SortKey::Read;
+    }
 
     // `ratatui::init` installs a panic hook that restores the terminal; add
     // mouse capture to what gets undone.

@@ -4,12 +4,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Table,
+    ScrollbarState, Table, Wrap,
 };
 
 use crate::app::{App, Focus, SortKey};
 use crate::graph::{Graph, Grow, Stops, gradient};
-use crate::scan::{Access, Kind, OpenFile};
+use crate::scan::{Access, Kind, Mode, OpenFile};
 use crate::util::{fmt_bytes, fmt_rate, truncate_left, truncate_right};
 
 const TEXT: Color = Color::Rgb(0xcc, 0xcc, 0xcc);
@@ -50,6 +50,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     let [main, footer] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    if app.mode == Mode::ReadHistory {
+        draw_read_history(f, app, main);
+        draw_footer(f, app, footer);
+        if app.show_help {
+            draw_help(f, area);
+        }
+        if app.show_file_details {
+            draw_file_details(f, app, area);
+        }
+        return;
+    }
     let top_h = (main.height / 3).clamp(8, 14);
     let [top, bottom] =
         Layout::vertical([Constraint::Length(top_h), Constraint::Fill(1)]).areas(main);
@@ -354,9 +365,20 @@ fn draw_target(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(scan));
         if s.denied > 0 {
             lines.push(Line::from(Span::styled(
-                format!("{} unreadable processes, run as root", s.denied),
+                format!(
+                    "{} unreadable processes, run as {}",
+                    s.denied,
+                    if cfg!(windows) {
+                        "Administrator"
+                    } else {
+                        "root"
+                    }
+                ),
                 Style::new().fg(WARN),
             )));
+        }
+        if let Some(warning) = &s.warning {
+            lines.insert(0, Line::styled(warning.clone(), Style::new().fg(WARN)));
         }
     } else {
         lines.push(Line::from(Span::styled("scanning…", dim)));
@@ -964,6 +986,407 @@ fn file_row(of: &OpenFile, target: &crate::target::Target, path_w: usize) -> Row
 
 // --- footer and help ----------------------------------------------------------
 
+fn draw_read_history(f: &mut Frame, app: &mut App, area: Rect) {
+    app.file_rows = Rect::default();
+    let [heading, body] = Layout::vertical([
+        Constraint::Length(if app.snap.as_ref().is_some_and(|s| s.warning.is_some()) {
+            4
+        } else {
+            3
+        }),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    let counters = if cfg!(windows) {
+        "Windows read transfer bytes (files, network and devices)"
+    } else {
+        "Linux rchar (read syscalls); disk bytes shown separately"
+    };
+    let status = app.snap.as_ref().map_or_else(
+        || "scanning...".into(),
+        |s| {
+            format!(
+                "{} observed / {} scanned | {} unreadable | {} ms refresh{}",
+                s.totals.procs,
+                s.scanned,
+                s.denied,
+                app.interval.as_millis(),
+                if app.paused { " | PAUSED" } else { "" }
+            )
+        },
+    );
+    let mut heading_lines = vec![
+        Line::styled(
+            " per-process read I/O history",
+            Style::new().fg(TITLE).bold(),
+        ),
+        Line::styled(format!(" {counters}"), Style::new().fg(DIM)),
+        Line::styled(format!(" {status}"), Style::new().fg(DIM)),
+    ];
+    if let Some(warning) = app.snap.as_ref().and_then(|s| s.warning.as_ref()) {
+        heading_lines.push(Line::styled(warning.clone(), Style::new().fg(WARN)));
+    }
+    f.render_widget(Paragraph::new(heading_lines), heading);
+    let (list, detail) = if area.width >= 110 {
+        let [a, b] =
+            Layout::horizontal([Constraint::Percentage(45), Constraint::Fill(1)]).areas(body);
+        (a, b)
+    } else {
+        let [a, b] =
+            Layout::vertical([Constraint::Percentage(40), Constraint::Fill(1)]).areas(body);
+        (a, b)
+    };
+    let block = panel("processes | observed read total", BORDER_PROCS);
+    let inner = block.inner(list);
+    f.render_widget(block, list);
+    let rows: Vec<Row> = app
+        .snap
+        .as_ref()
+        .map(|s| {
+            app.view
+                .iter()
+                .map(|&i| {
+                    let p = &s.procs[i];
+                    Row::new(vec![
+                        Cell::from(p.pid.to_string()),
+                        Cell::from(p.comm.clone()),
+                        rate_cell(p.read_bps, READ, p.io.is_none()),
+                        Cell::from(fmt_bytes(p.read_total)),
+                        Cell::from(if p.io.is_some() { "live" } else { "unseen" }),
+                    ])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    app.proc_rows = Rect {
+        y: inner.y + 1,
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    f.render_stateful_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(7),
+                Constraint::Fill(1),
+                Constraint::Length(12),
+                Constraint::Length(11),
+                Constraint::Length(6),
+            ],
+        )
+        .header(
+            Row::new(["PID", "PROCESS", "READ/s", "TOTAL", "STATE"])
+                .style(Style::new().fg(TITLE).bold()),
+        )
+        .column_spacing(1)
+        .row_highlight_style(Style::new().bg(SELECTED).bold()),
+        inner,
+        &mut app.proc_state,
+    );
+    if app.view.is_empty() {
+        empty_message(
+            f,
+            inner,
+            if app.snap.is_none() {
+                "scanning..."
+            } else {
+                "no observable processes match this view"
+            },
+        );
+    }
+    let Some(p) = app.selected_proc().cloned() else {
+        f.render_widget(
+            Paragraph::new("Select a process to inspect its read history")
+                .block(panel("read history", BORDER_DETAIL)),
+            detail,
+        );
+        return;
+    };
+    let block = panel(
+        &format!("pid {} | {} | read history", p.pid, p.comm),
+        BORDER_DETAIL,
+    );
+    let inner = block.inner(detail);
+    f.render_widget(block, detail);
+    let graph_height = if inner.height >= 14 {
+        (inner.height / 4).clamp(3, 8)
+    } else {
+        1
+    };
+    let samples_height = if inner.height >= 16 { 4 } else { 1 };
+    let [stats, graph, samples, files] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(graph_height),
+        Constraint::Length(samples_height),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    let history = app.read_history.get(&p.pid);
+    let peak = history.map_or(0.0, |h| h.iter().map(|s| s.bps).fold(0.0, f64::max));
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                truncate_right(&p.cmdline, stats.width as usize),
+                Style::new().fg(DIM),
+            ),
+            Line::styled(
+                format!(
+                    "read {} | peak {} | observed {}",
+                    fmt_rate(p.read_bps),
+                    fmt_rate(peak),
+                    fmt_bytes(p.read_total)
+                ),
+                Style::new().fg(TEXT),
+            ),
+            Line::styled(
+                if p.io.is_some() {
+                    "240 samples; totals count bytes observed since monitoring began"
+                } else {
+                    "Process no longer observable; recent samples retained for 2 minutes"
+                },
+                Style::new().fg(DIM),
+            ),
+        ]),
+        stats,
+    );
+    let series: Vec<_> = history
+        .map(|h| h.iter().map(|s| s.bps).collect())
+        .unwrap_or_default();
+    f.render_widget(
+        Graph {
+            data: &series,
+            max: peak.max(1024.0),
+            grow: Grow::Up,
+            stops: READ,
+        },
+        graph,
+    );
+    let now = std::time::Instant::now();
+    let rows: Vec<_> = history
+        .map(|h| {
+            h.iter()
+                .rev()
+                .take(samples.height.saturating_sub(1) as usize)
+                .map(|s| {
+                    Row::new(vec![
+                        Cell::from(format!(
+                            "{:.1}s ago",
+                            now.duration_since(s.at).as_secs_f64()
+                        )),
+                        Cell::from(if s.observed {
+                            fmt_rate(s.bps)
+                        } else {
+                            "unseen".into()
+                        }),
+                        Cell::from(s.disk_bps.map_or_else(|| "n/a".into(), fmt_rate)),
+                        Cell::from(fmt_bytes(s.total)),
+                    ])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(12),
+                Constraint::Fill(1),
+                Constraint::Fill(1),
+                Constraint::Fill(1),
+            ],
+        )
+        .column_spacing(1)
+        .header(
+            Row::new(["SAMPLE AGE", "READ/s", "DISK READ/s", "TOTAL"]).style(Style::new().fg(DIM)),
+        ),
+        samples,
+    );
+    draw_file_history(f, app, p.pid, files);
+}
+
+fn draw_file_history(f: &mut Frame, app: &mut App, pid: u32, area: Rect) {
+    let block = panel(
+        "file access history | Tab to select",
+        if app.focus == Focus::Files {
+            HOTKEY
+        } else {
+            BORDER_DETAIL
+        },
+    );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let Some(visits) = app.file_history.get(&pid).filter(|v| !v.is_empty()) else {
+        empty_message(
+            f,
+            inner,
+            "No file handles observed yet (brief accesses may be missed)",
+        );
+        app.file_rows = Rect::default();
+        return;
+    };
+    let now = std::time::Instant::now();
+    let detail_height = if inner.height >= 5 { 2 } else { 0 };
+    let [table_area, info] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(detail_height)]).areas(inner);
+    let path_width = table_area.width.saturating_sub(33) as usize;
+    let rows: Vec<_> = visits
+        .iter()
+        .map(|v| {
+            let state = match v.open {
+                Some(true) => "open",
+                Some(false) => "closed",
+                None => "unseen",
+            };
+            let mode = match v.access {
+                Access::Read => "R",
+                Access::Write => "W",
+                Access::ReadWrite => "RW",
+            };
+            let kind = match v.kind {
+                Kind::File => "",
+                Kind::Dir => " [dir]",
+                Kind::Map => " [map]",
+                Kind::Other => " [other]",
+            };
+            let path = format!(
+                "{}{kind}{}{}",
+                v.path.display(),
+                if v.deleted { " [deleted]" } else { "" },
+                if v.shared { " [shared]" } else { "" }
+            );
+            Row::new(vec![
+                Cell::from(state),
+                Cell::from(mode),
+                Cell::from(format!(
+                    "{:.1}s",
+                    now.duration_since(v.last_seen).as_secs_f64()
+                )),
+                rate_cell(v.read_bps, READ, v.open != Some(true)),
+                Cell::from(truncate_left(&path, path_width)),
+            ])
+            .style(Style::new().fg(if v.open == Some(true) { TEXT } else { DIM }))
+        })
+        .collect();
+    app.file_rows = Rect {
+        y: table_area.y + 1,
+        height: table_area.height.saturating_sub(1),
+        ..table_area
+    };
+    f.render_stateful_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(6),
+                Constraint::Length(3),
+                Constraint::Length(8),
+                Constraint::Length(11),
+                Constraint::Fill(1),
+            ],
+        )
+        .column_spacing(1)
+        .header(
+            Row::new(["STATE", "MODE", "LAST SEEN", "READ/s est", "FILE / HANDLE"])
+                .style(Style::new().fg(TITLE)),
+        )
+        .row_highlight_style(Style::new().bg(if app.focus == Focus::Files {
+            SELECTED
+        } else {
+            SELECTED_DIM
+        })),
+        table_area,
+        &mut app.file_state,
+    );
+    if let Some(v) = app.file_state.selected().and_then(|i| visits.get(i)) {
+        f.render_widget(Paragraph::new(vec![
+            Line::styled(v.path.display().to_string(), Style::new().fg(TEXT)),
+            Line::styled(format!("first {:.1}s ago | last {:.1}s ago | {} observations | offset {} / {} | write est {}", now.duration_since(v.first_seen).as_secs_f64(), now.duration_since(v.last_seen).as_secs_f64(), v.visits, fmt_bytes(v.pos), fmt_bytes(v.size), fmt_rate(v.write_bps)), Style::new().fg(DIM)),
+        ]), info);
+    }
+}
+
+fn draw_file_details(f: &mut Frame, app: &App, area: Rect) {
+    let Some(visit) = app
+        .selected
+        .and_then(|pid| app.file_history.get(&pid))
+        .and_then(|files| app.file_state.selected().and_then(|i| files.get(i)))
+    else {
+        return;
+    };
+    let width = area.width.saturating_sub(4).min(110);
+    let height = area.height.saturating_sub(2).min(18);
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let now = std::time::Instant::now();
+    let age = |time: Option<std::time::Instant>| {
+        time.map_or_else(
+            || "not observed".into(),
+            |t| format!("{:.1}s ago", now.duration_since(t).as_secs_f64()),
+        )
+    };
+    let access = match visit.access {
+        Access::Read => "read",
+        Access::Write => "write",
+        Access::ReadWrite => "read/write",
+    };
+    let state = match visit.open {
+        Some(true) => "open",
+        Some(false) => "closed",
+        None => "unseen (handles unavailable)",
+    };
+    let lines = vec![
+        Line::styled(
+            visit.path.display().to_string(),
+            Style::new().fg(TITLE).bold(),
+        ),
+        Line::raw(""),
+        Line::raw(format!(
+            "{state} | access {access} | {:?} | {} observation periods",
+            visit.kind, visit.visits
+        )),
+        Line::raw(format!(
+            "first seen {} | last seen {}",
+            age(Some(visit.first_seen)),
+            age(Some(visit.last_seen))
+        )),
+        Line::raw(format!(
+            "last estimated read {} | write {}",
+            age(visit.last_read),
+            age(visit.last_write)
+        )),
+        Line::raw(format!(
+            "offset {} | size {}",
+            fmt_bytes(visit.pos),
+            fmt_bytes(visit.size)
+        )),
+        Line::raw(format!(
+            "estimated read {} | write {}",
+            fmt_rate(visit.read_bps),
+            fmt_rate(visit.write_bps)
+        )),
+        Line::raw(format!(
+            "deleted {} | shared handle {}",
+            visit.deleted, visit.shared
+        )),
+        Line::raw(""),
+        Line::styled(
+            "Sampled handles and offset estimates; short-lived accesses can be missed.",
+            Style::new().fg(DIM),
+        ),
+        Line::styled("Press any key to close", Style::new().fg(DIM)),
+    ];
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel("file details", HOTKEY)),
+        rect,
+    );
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if app.editing_filter {
         let line = Line::from(vec![
@@ -975,8 +1398,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(line), area);
         return;
     }
-    let hints: [(&str, String); 10] = [
+    let hints: [(&str, String); 11] = [
         ("q", "uit".into()),
+        ("m", " mode".into()),
         ("↑↓", " select".into()),
         ("s", format!("ort {}", app.sort.label())),
         ("r", "everse".into()),
@@ -1000,7 +1424,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let w = 66.min(area.width);
-    let h = 23.min(area.height);
+    let h = 25.min(area.height);
     let rect = Rect::new(
         area.x + (area.width - w) / 2,
         area.y + (area.height - h) / 2,
@@ -1030,16 +1454,18 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("i", "show only processes that are moving data"),
         key("/", "filter by name, pid, user, command or path"),
         key("g", "group folders by depth below the target"),
+        key("m", "switch path / per-process read history mode"),
+        key("Enter", "inspect selected file in history mode"),
         key("+ -", "refresh interval"),
         key("p  space", "pause / resume"),
         key("R", "refresh now"),
         key("q  ctrl-c", "quit"),
         Line::raw(""),
-        note("Rates come from file offsets in /proc/<pid>/fdinfo."),
+        note("Path rates estimate file offsets; history uses process counters."),
         note("≤ N/s: the process moved up to N overall while no offset under"),
         note("the path advanced (pread, mmap, or its other files/sockets)."),
         note("Opens shorter than the refresh interval can be missed. Other"),
-        note("users' processes need root. Rows linger a few seconds."),
+        note("users' processes may need root/Administrator privileges."),
         Line::raw(""),
         Line::from(Span::styled(
             " press any key to close",
@@ -1114,6 +1540,7 @@ mod tests {
         gone.shared = true;
         let mpv = ProcActivity {
             pid: 4242,
+            identity: 4242,
             ppid: 1,
             comm: "mpv".into(),
             cmdline: "mpv --no-video /tmp/music/album/track01.flac".into(),
@@ -1134,6 +1561,7 @@ mod tests {
                     4096,
                 ),
             ],
+            files_observed: true,
             read_bps: 48.0e6,
             write_bps: 0.0,
             read_total: 3 << 30,
@@ -1246,6 +1674,8 @@ mod tests {
             scanned: 312,
             denied: 41,
             scan_time: Duration::from_millis(7),
+            mode: Mode::Path,
+            warning: None,
         });
         app
     }
@@ -1316,6 +1746,46 @@ mod tests {
     }
 
     #[test]
+    fn read_history_mode_shows_process_counters_and_timestamped_samples() {
+        let mut app = demo();
+        let mut snap = app.snap.clone().unwrap();
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('m'),
+        ));
+        snap.mode = Mode::ReadHistory;
+        app.on_snapshot(snap);
+        for (w, h) in [(140, 40), (80, 30), (70, 20)] {
+            let text = render(&mut app, w, h);
+            assert!(text.contains("per-process read I/O history"), "{text}");
+            assert!(text.contains("SAMPLE AGE"), "{text}");
+            assert!(text.contains("DISK READ/s"), "{text}");
+            assert!(!text.contains("folders"), "{text}");
+        }
+        let text = render(&mut app, 140, 40);
+        assert!(
+            text.contains("track01.flac") && text.contains("FILE / HANDLE"),
+            "{text}"
+        );
+        let index = app.file_history[&4242]
+            .iter()
+            .position(|f| f.path.ends_with("track01.flac"))
+            .unwrap();
+        app.file_state.select(Some(index));
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Tab,
+        ));
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Enter,
+        ));
+        let text = render(&mut app, 140, 40);
+        assert!(
+            text.contains("file details") && text.contains("/tmp/music/album/track01.flac"),
+            "{text}"
+        );
+        assert!(text.contains("last estimated read"), "{text}");
+    }
+
+    #[test]
     fn tiny_terminal_and_empty_states_do_not_panic() {
         let mut app = demo();
         assert!(render(&mut app, 50, 12).contains("terminal too small"));
@@ -1333,6 +1803,8 @@ mod tests {
             scanned: 1,
             denied: 0,
             scan_time: Duration::ZERO,
+            mode: Mode::Path,
+            warning: None,
         });
         assert!(render(&mut empty, 120, 36).contains("nothing has /tmp open right now"));
         for (w, h) in [(70, 20), (71, 21), (109, 23), (110, 24), (300, 80)] {
